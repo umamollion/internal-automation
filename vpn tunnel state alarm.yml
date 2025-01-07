@@ -1,0 +1,126 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: CloudFormation Template to create IAM Role, Lambda Function, CloudWatch Event Rule, and Lambda Permission with VPN existing scan feature.
+
+Resources:
+  # Lambda Execution Role
+  UmamDplyLambdaExecutionRole:
+    Type: 'AWS::IAM::Role'
+    Properties: 
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: 
+                - lambda.amazonaws.com
+            Action: 
+              - sts:AssumeRole
+      Policies:
+        - PolicyName: ummdplyLambdaPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - ec2:DescribeVpnConnections
+                  - cloudwatch:PutMetricAlarm
+                Resource: '*'
+    DeletionPolicy: Retain
+
+  # Lambda Function
+  UmamDplyLambdaFunction:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      FunctionName: ummdplyVpnTunnelAlarm
+      Handler: index.handler
+      Role: !GetAtt UmamDplyLambdaExecutionRole.Arn
+      Runtime: 'python3.8'
+      Timeout: 300
+      Code:
+        ZipFile: |
+          import boto3
+
+          def create_alarm(vpn_connection_id, tunnel, sns_topic_arn):
+              cloudwatch = boto3.client('cloudwatch')
+              alarm_name = f'umm-dply-VPN-{vpn_connection_id}-Tunnel{tunnel}-Status'
+
+              # Check if the alarm already exists
+              existing_alarms = cloudwatch.describe_alarms(
+                  AlarmNames=[alarm_name]
+              )
+
+              if not existing_alarms['MetricAlarms']:
+                  # Create alarm if it doesn't exist
+                  cloudwatch.put_metric_alarm(
+                      AlarmName=alarm_name,
+                      AlarmDescription=f'Alarm for VPN {vpn_connection_id} Tunnel {tunnel} status',
+                      ActionsEnabled=True,
+                      AlarmActions=[sns_topic_arn],
+                      MetricName='TunnelState',
+                      Namespace='AWS/VPN',
+                      Statistic='Average',
+                      Dimensions=[
+                          {
+                              'Name': 'VpnId',
+                              'Value': vpn_connection_id
+                          },
+                          {
+                              'Name': 'TunnelIpAddress',
+                              'Value': tunnel
+                          }
+                      ],
+                      Period=300,
+                      EvaluationPeriods=1,
+                      Threshold=1,
+                      ComparisonOperator='LessThanThreshold',
+                      TreatMissingData='breaching'
+                  )
+
+          def handler(event, context):
+              ec2 = boto3.client('ec2')
+              sns_topic_arn = "arn:aws:sns:ap-southeast-1:003866745935:umam-alert-topic"
+              
+              # Describe all VPN connections
+              response = ec2.describe_vpn_connections()
+              vpn_connections = response.get('VpnConnections', [])
+              
+              for vpn_connection in vpn_connections:
+                  vpn_connection_id = vpn_connection['VpnConnectionId']
+                  for tunnel in vpn_connection['VgwTelemetry']:
+                      create_alarm(vpn_connection_id, tunnel['OutsideIpAddress'], sns_topic_arn)
+    DeletionPolicy: Retain
+
+  # CloudWatch Event Rule to trigger Lambda on VPN state changes
+  UmamDplyVpnStateChangeRule:
+    Type: 'AWS::Events::Rule'
+    Properties:
+      Name: ummdplyVpnStateChangeRule
+      EventPattern:
+        source:
+          - "aws.ec2"
+        detail-type:
+          - "AWS API Call via CloudTrail"
+        detail:
+          eventSource:
+            - "ec2.amazonaws.com"
+          eventName:
+            - "CreateVpnConnection"
+      Targets:
+        - Arn: !GetAtt UmamDplyLambdaFunction.Arn
+          Id: TargetFunction
+    DeletionPolicy: Retain
+    DependsOn: UmamDplyLambdaFunction
+
+  # Lambda Permission to be invoked by CloudWatch Events
+  UmamDplyLambdaPermission:
+    Type: 'AWS::Lambda::Permission'
+    Properties:
+      FunctionName: !Ref UmamDplyLambdaFunction
+      Action: 'lambda:InvokeFunction'
+      Principal: 'events.amazonaws.com'
+      SourceArn: !GetAtt UmamDplyVpnStateChangeRule.Arn
+    DeletionPolicy: Retain
+    DependsOn: UmamDplyVpnStateChangeRule
